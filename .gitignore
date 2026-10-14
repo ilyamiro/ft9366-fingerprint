@@ -1,0 +1,10 @@
+result
+result-*
+driver/result
+test/test_harness
+__pycache__/
+*.pyc
+# never commit fingerprint images or raw captures
+*.pgm
+*.pcapng
+*.bin
