@@ -30,7 +30,7 @@ One template is stored per enrollment touch (12 touches, about 13 KB each).
 4. Warp the ridge maps together and measure how many overlapping pixels agree locally; a poor
    agreement lowers the score.
 5. Accept when the score is >= 7 and the agreement ratio is >= 0.7 (`FT_ACCEPT_*` in
-   `driver/ft9366_match.h`). A touch matches if it matches any stored template.
+   `libfprint/drivers/ft9366/ft9366_match.h`). A touch matches if it matches any stored template.
 
 ## Measured behaviour
 On a test set of 75 touches from 5 fingers of one person, with deliberately varied finger placement:

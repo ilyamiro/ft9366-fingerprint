@@ -2,14 +2,7 @@
  * Driver for FocalTech FT9366 fingerprint sensors behind a Realtek RTS5811 USB
  * bridge (USB 2808:a658)
  *
- * Protocol knowledge comes from observing the reader's USB traffic.
- * The sensor delivers a 64x80 frame of 16-bit samples. The sensor is only about
- * 3x4 mm, too small for minutiae based matching, so this driver does its own
- * matching (ft9366_match.c: keypoints + binary descriptors + ridge map overlay)
- * and stores one template per enrolment touch.
- *
- * Everything runs on the main context using asynchronous USB transfers and state
- * machines; there are no threads.
+ * Copyright (C) 2026 ilyamiro
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -20,76 +13,22 @@
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
  * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
 #define FP_COMPONENT "ft9366"
 
 #include <math.h>
+
 #include "drivers_api.h"
+
+#include "ft9366.h"
 #include "ft9366_script.h"
-#include "ft9366_match.c"   /* single translation unit: the matcher is not libfprint specific */
 
-#define FT_EP_OUT       0x01
-#define FT_EP_IN        0x82
-#define FT_INTF         0
-#define FT_WIDTH        FT_W
-#define FT_HEIGHT       FT_H
-#define FT_FRAME_LEN    (FT_NPIX * 2)
-#define FT_TIMEOUT_MS   3000
-#define FT_CYCLE_MS     150
-#define FT_FRAME_GAP_MS 60
-#define FT_RESET_WAIT_MS 500
-
-/* frames per touch that are skipped (partial contact) and then averaged */
-#define FT_SKIP_FRAMES 2
-#define FT_USE_FRAMES  3
-#define FT_MAX_FRAMES  (FT_SKIP_FRAMES + FT_USE_FRAMES)
-
-#define FT_FLAG_DOWN 0x0002
-
-/* A touch needs at least this many keypoints to be usable. */
-#define FT_MIN_KEYPOINTS 40
-/* Touches per enrolment: the matcher works per touch, more touches cover more of the finger. */
-#define FT_ENROLL_STAGES 12
-#define FT_PRINT_VERSION 1
-
-/* Large buffers live outside the GObject instance (GObject limits it to 64 KiB). */
-typedef struct
-{
-  guint8  reply[FT_FRAME_LEN];
-  guint8  frame[FT_FRAME_LEN];
-  guint16 ref_a[FT_NPIX];
-  guint16 base[FT_NPIX];   /* empty-sensor reference, taken from the init scans */
-  guint32 sum[FT_NPIX];
-  guint8  img[FT_NPIX];    /* converted image of the last touch */
-} FtBuf;
-
-struct _FpiDeviceFt9366
-{
-  FpDevice      parent;
-
-  FtBuf        *b;
-
-  /* script interpreter cursor */
-  const guint8 *script;
-  gsize         script_size;
-  gsize         script_pos;
-  gsize         reply_len;
-  gboolean      have_frame;
-
-  gboolean      collect_ref;
-  int           init_frames;
-
-  /* current operation */
-  FpiSsm       *active;
-  int           frames;
-  int           used;
-  int           clear;
-  int           stage;
-  GPtrArray    *enrolled;   /* FtTemplate * collected while enrolling */
-};
-G_DECLARE_FINAL_TYPE (FpiDeviceFt9366, fpi_device_ft9366, FPI, DEVICE_FT9366, FpDevice);
-G_DEFINE_TYPE (FpiDeviceFt9366, fpi_device_ft9366, FP_TYPE_DEVICE);
+G_DEFINE_TYPE (FpiDeviceFt9366, fpi_device_ft9366, FP_TYPE_DEVICE)
 
 static const FpIdEntry id_table[] = {
   { .vid = 0x2808, .pid = 0xa658 },
@@ -101,7 +40,7 @@ frame_to_u16 (const guint8 *raw, guint16 *out)
 {
   int i;
 
-  for (i = 0; i < FT_NPIX; i++)
+  for (i = 0; i < FT9366_NPIX; i++)
     out[i] = (raw[2 * i] << 8) | raw[2 * i + 1];
 }
 
@@ -111,9 +50,9 @@ u16_mean (const guint16 *v)
   double s = 0;
   int i;
 
-  for (i = 0; i < FT_NPIX; i++)
+  for (i = 0; i < FT9366_NPIX; i++)
     s += v[i];
-  return s / FT_NPIX;
+  return s / FT9366_NPIX;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -125,7 +64,7 @@ enum { SCRIPT_STEP, SCRIPT_NUM_STATES };
 static void
 frame_received (FpiDeviceFt9366 *self)
 {
-  memcpy (self->b->frame, self->b->reply, FT_FRAME_LEN);
+  memcpy (self->b->frame, self->b->reply, FT9366_FRAME_LEN);
   self->have_frame = TRUE;
 
   if (!self->collect_ref)
@@ -138,11 +77,11 @@ frame_received (FpiDeviceFt9366 *self)
     }
   else if (self->init_frames == 3)
     {
-      guint16 b[FT_NPIX];
+      guint16 b[FT9366_NPIX];
       int i;
 
       frame_to_u16 (self->b->frame, b);
-      for (i = 0; i < FT_NPIX; i++)
+      for (i = 0; i < FT9366_NPIX; i++)
         self->b->base[i] = (self->b->ref_a[i] + b[i]) / 2;
       fp_dbg ("reference frame mean %.0f", u16_mean (self->b->base));
       if (u16_mean (self->b->base) < 1500)
@@ -166,7 +105,7 @@ script_transfer_cb (FpiUsbTransfer *transfer,
       return;
     }
 
-  if (transfer->endpoint == FT_EP_IN)
+  if (transfer->endpoint == FT9366_EP_IN)
     {
       if (transfer->actual_length != (gssize) transfer->length ||
           transfer->length > sizeof (self->b->reply))
@@ -177,7 +116,7 @@ script_transfer_cb (FpiUsbTransfer *transfer,
         }
       memcpy (self->b->reply, transfer->buffer, transfer->length);
       self->reply_len = transfer->length;
-      if (self->reply_len == FT_FRAME_LEN)
+      if (self->reply_len == FT9366_FRAME_LEN)
         frame_received (self);
     }
 
@@ -189,51 +128,46 @@ script_run_state (FpiSsm *ssm, FpDevice *dev)
 {
   FpiDeviceFt9366 *self = FPI_DEVICE_FT9366 (dev);
   FpiUsbTransfer *transfer;
-  guint8 op;
-  gsize len;
+  const Ft9366Step *step;
 
-  if (self->script_pos + 3 > self->script_size)
+  if (self->script_pos >= self->script_len)
     {
       fpi_ssm_mark_completed (ssm);
       return;
     }
 
-  op = self->script[self->script_pos];
-  len = (self->script[self->script_pos + 1] << 8) | self->script[self->script_pos + 2];
-  self->script_pos += 3;
+  step = &self->script[self->script_pos++];
 
-  switch (op)
+  switch (step->type)
     {
-    case 0: /* bulk write */
+    case FT9366_STEP_WRITE:
       transfer = fpi_usb_transfer_new (dev);
-      fpi_usb_transfer_fill_bulk_full (transfer, FT_EP_OUT,
-                                       (guint8 *) self->script + self->script_pos, len, NULL);
-      self->script_pos += len;
-      fpi_usb_transfer_submit (transfer, FT_TIMEOUT_MS, NULL, script_transfer_cb, ssm);
+      fpi_usb_transfer_fill_bulk_full (transfer, FT9366_EP_OUT,
+                                       (guint8 *) step->data, step->len, NULL);
+      fpi_usb_transfer_submit (transfer, FT9366_TIMEOUT_MS, NULL, script_transfer_cb, ssm);
       break;
 
-    case 1: /* bulk read */
+    case FT9366_STEP_READ:
       transfer = fpi_usb_transfer_new (dev);
-      fpi_usb_transfer_fill_bulk (transfer, FT_EP_IN, len);
+      fpi_usb_transfer_fill_bulk (transfer, FT9366_EP_IN, step->len);
       fpi_usb_transfer_set_short_error (transfer, TRUE);
-      fpi_usb_transfer_submit (transfer, FT_TIMEOUT_MS, NULL, script_transfer_cb, ssm);
+      fpi_usb_transfer_submit (transfer, FT9366_TIMEOUT_MS, NULL, script_transfer_cb, ssm);
       break;
 
-    case 2: /* delay */
-      fpi_ssm_jump_to_state_delayed (ssm, SCRIPT_STEP, len);
+    case FT9366_STEP_DELAY:
+      fpi_ssm_jump_to_state_delayed (ssm, SCRIPT_STEP, step->len);
       break;
 
     default:
-      fpi_ssm_mark_failed (ssm, fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL,
-                                                          "bad script opcode"));
+      g_assert_not_reached ();
     }
 }
 
 static void
-start_script (FpiSsm *parent, FpiDeviceFt9366 *self, const guint8 *script, gsize size)
+start_script (FpiSsm *parent, FpiDeviceFt9366 *self, const Ft9366Step *script, gsize len)
 {
   self->script = script;
-  self->script_size = size;
+  self->script_len = len;
   self->script_pos = 0;
   self->have_frame = FALSE;
   self->reply_len = 0;
@@ -242,7 +176,7 @@ start_script (FpiSsm *parent, FpiDeviceFt9366 *self, const guint8 *script, gsize
 }
 
 #define START_SCRIPT(ssm, self, name) \
-  start_script (ssm, self, ft9366_ ## name ## _script, sizeof (ft9366_ ## name ## _script))
+  start_script (ssm, self, ft9366_ ## name ## _script, G_N_ELEMENTS (ft9366_ ## name ## _script))
 
 /* The idle script's last reply is the interrupt flag register. */
 static gboolean
@@ -305,7 +239,7 @@ poll_run_state (FpiSsm *ssm, FpDevice *dev)
     case POLL_EVAL:
       if (!get_flag (ssm, self, &flag))
         return;
-      if (flag & FT_FLAG_DOWN)
+      if (flag & FT9366_FLAG_DOWN)
         {
           memset (self->b->sum, 0, sizeof (self->b->sum));
           self->frames = 0;
@@ -319,7 +253,7 @@ poll_run_state (FpiSsm *ssm, FpDevice *dev)
       break;
 
     case POLL_SLEEP:
-      fpi_ssm_jump_to_state_delayed (ssm, POLL_CYCLE, FT_CYCLE_MS);
+      fpi_ssm_jump_to_state_delayed (ssm, POLL_CYCLE, FT9366_CYCLE_MS);
       break;
 
     case POLL_SCAN:
@@ -333,13 +267,13 @@ poll_run_state (FpiSsm *ssm, FpDevice *dev)
                                                               "scan returned no image"));
           return;
         }
-      if (self->frames >= FT_SKIP_FRAMES)
+      if (self->frames >= FT9366_SKIP_FRAMES)
         {
-          guint16 tmp[FT_NPIX];
+          guint16 tmp[FT9366_NPIX];
           int i;
 
           frame_to_u16 (self->b->frame, tmp);
-          for (i = 0; i < FT_NPIX; i++)
+          for (i = 0; i < FT9366_NPIX; i++)
             self->b->sum[i] += tmp[i];
           self->used++;
         }
@@ -354,8 +288,8 @@ poll_run_state (FpiSsm *ssm, FpDevice *dev)
     case POLL_FLAG_EVAL:
       if (!get_flag (ssm, self, &flag))
         return;
-      if (self->frames < FT_MAX_FRAMES && (flag & FT_FLAG_DOWN))
-        fpi_ssm_jump_to_state_delayed (ssm, POLL_SCAN, FT_FRAME_GAP_MS);
+      if (self->frames < FT9366_MAX_FRAMES && (flag & FT9366_FLAG_DOWN))
+        fpi_ssm_jump_to_state_delayed (ssm, POLL_SCAN, FT9366_FRAME_GAP_MS);
       else
         fpi_ssm_jump_to_state (ssm, POLL_FINISH);
       break;
@@ -364,16 +298,16 @@ poll_run_state (FpiSsm *ssm, FpDevice *dev)
       if (self->used == 0)
         {
           /* touch too short to get a usable frame */
-          fpi_ssm_jump_to_state_delayed (ssm, POLL_CYCLE, FT_CYCLE_MS);
+          fpi_ssm_jump_to_state_delayed (ssm, POLL_CYCLE, FT9366_CYCLE_MS);
         }
       else
         {
-          guint16 raw[FT_NPIX];
+          guint16 raw[FT9366_NPIX];
           int i;
 
-          for (i = 0; i < FT_NPIX; i++)
+          for (i = 0; i < FT9366_NPIX; i++)
             raw[i] = self->b->sum[i] / self->used;
-          ft_convert_image (raw, self->b->base, self->b->img);
+          ft9366_convert_image (raw, self->b->base, self->b->img);
           fpi_ssm_mark_completed (ssm);
         }
       break;
@@ -426,11 +360,11 @@ off_run_state (FpiSsm *ssm, FpDevice *dev)
     case OFF_EVAL:
       if (!get_flag (ssm, self, &flag))
         return;
-      self->clear = (flag & FT_FLAG_DOWN) ? 0 : self->clear + 1;
+      self->clear = (flag & FT9366_FLAG_DOWN) ? 0 : self->clear + 1;
       if (self->clear >= 2)
         fpi_ssm_mark_completed (ssm);
       else
-        fpi_ssm_jump_to_state_delayed (ssm, OFF_CYCLE, FT_CYCLE_MS);
+        fpi_ssm_jump_to_state_delayed (ssm, OFF_CYCLE, FT9366_CYCLE_MS);
       break;
 
     default:
@@ -482,20 +416,20 @@ templates_to_variant (GPtrArray *tpls)
 {
   GVariantBuilder b;
   guint i;
-  guint8 *buf = g_malloc (FT_TEMPLATE_PACKED_SIZE);
+  guint8 *buf = g_malloc (FT9366_TEMPLATE_PACKED_SIZE);
 
   g_variant_builder_init (&b, G_VARIANT_TYPE ("aay"));
   for (i = 0; i < tpls->len; i++)
     {
-      ft_template_pack (g_ptr_array_index (tpls, i), buf);
+      ft9366_template_pack (g_ptr_array_index (tpls, i), buf);
       g_variant_builder_add_value (&b, g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE, buf,
-                                                                  FT_TEMPLATE_PACKED_SIZE, 1));
+                                                                  FT9366_TEMPLATE_PACKED_SIZE, 1));
     }
   g_free (buf);
-  return g_variant_new ("(uaay)", (guint32) FT_PRINT_VERSION, &b);
+  return g_variant_new ("(uaay)", (guint32) FT9366_PRINT_VERSION, &b);
 }
 
-/* returns a GPtrArray of FtTemplate *, or NULL if the print is not ours */
+/* returns a GPtrArray of Ft9366Template *, or NULL if the print is not ours */
 static GPtrArray *
 templates_from_print (FpPrint *print)
 {
@@ -509,7 +443,7 @@ templates_from_print (FpPrint *print)
   if (!data || !g_variant_is_of_type (data, G_VARIANT_TYPE ("(uaay)")))
     return NULL;
   g_variant_get (data, "(u@aay)", &version, &list);
-  if (version != FT_PRINT_VERSION)
+  if (version != FT9366_PRINT_VERSION)
     return NULL;
 
   out = g_ptr_array_new_with_free_func (g_free);
@@ -519,9 +453,9 @@ templates_from_print (FpPrint *print)
       g_autoptr(GVariant) item = g_variant_get_child_value (list, i);
       gsize len;
       gconstpointer p = g_variant_get_fixed_array (item, &len, 1);
-      FtTemplate *t = g_new0 (FtTemplate, 1);
+      Ft9366Template *t = g_new0 (Ft9366Template, 1);
 
-      if (ft_template_unpack (p, len, t) != 0)
+      if (ft9366_template_unpack (p, len, t) != 0)
         {
           g_free (t);
           continue;
@@ -532,17 +466,17 @@ templates_from_print (FpPrint *print)
 }
 
 static gboolean
-print_matches (FtTemplate *probe, GPtrArray *tpls)
+print_matches (Ft9366Template *probe, GPtrArray *tpls)
 {
   guint i;
 
   for (i = 0; i < tpls->len; i++)
     {
-      FtMatchResult r;
+      Ft9366MatchResult r;
 
-      ft_compare (probe, g_ptr_array_index (tpls, i), &r);
+      ft9366_compare (probe, g_ptr_array_index (tpls, i), &r);
       fp_dbg ("template %u: score %d ratio %.2f overlap %d", i, r.score, r.ratio, r.overlap);
-      if (ft_is_match (&r))
+      if (ft9366_is_match (&r))
         return TRUE;
     }
   return FALSE;
@@ -557,8 +491,8 @@ capture_ready (FpiDeviceFt9366 *self)
 {
   FpDevice *dev = FP_DEVICE (self);
   FpiDeviceAction action = fpi_device_get_current_action (dev);
-  FtTemplate *probe = g_new0 (FtTemplate, 1);
-  int nk = ft_template_build (self->b->img, probe);
+  Ft9366Template *probe = g_new0 (Ft9366Template, 1);
+  int nk = ft9366_template_build (self->b->img, probe);
 
   fp_dbg ("touch captured, %d keypoints", nk);
 
@@ -567,7 +501,7 @@ capture_ready (FpiDeviceFt9366 *self)
       FpPrint *print = NULL;
 
       fpi_device_get_enroll_data (dev, &print);
-      if (nk < FT_MIN_KEYPOINTS)
+      if (nk < FT9366_MIN_KEYPOINTS)
         {
           g_free (probe);
           fpi_device_enroll_progress (dev, self->stage, NULL,
@@ -581,7 +515,7 @@ capture_ready (FpiDeviceFt9366 *self)
           fpi_device_enroll_progress (dev, self->stage, NULL, NULL);
         }
 
-      if (self->stage >= FT_ENROLL_STAGES)
+      if (self->stage >= FT9366_ENROLL_STAGES)
         {
           g_object_set (print, "fpi-data", templates_to_variant (self->enrolled), NULL);
           g_ptr_array_set_size (self->enrolled, 0);
@@ -594,7 +528,7 @@ capture_ready (FpiDeviceFt9366 *self)
 
   if (action == FPI_DEVICE_ACTION_VERIFY || action == FPI_DEVICE_ACTION_IDENTIFY)
     {
-      if (nk < FT_MIN_KEYPOINTS)
+      if (nk < FT9366_MIN_KEYPOINTS)
         {
           GError *err = fpi_device_retry_new_msg (FP_DEVICE_RETRY_CENTER_FINGER,
                                                   "Not enough fingerprint detail, press the finger firmly on the sensor");
@@ -675,7 +609,7 @@ init_run_state (FpiSsm *ssm, FpDevice *dev)
     {
     case INIT_WAIT:
       /* give the bridge time to come back after the USB reset */
-      fpi_ssm_next_state_delayed (ssm, FT_RESET_WAIT_MS);
+      fpi_ssm_next_state_delayed (ssm, FT9366_RESET_WAIT_MS);
       break;
 
     case INIT_RUN:
@@ -718,13 +652,13 @@ dev_open (FpDevice *dev)
 
   self->active = NULL;
   g_clear_pointer (&self->b, g_free);
-  self->b = g_new0 (FtBuf, 1);
+  self->b = g_new0 (Ft9366Buf, 1);
   g_clear_pointer (&self->enrolled, g_ptr_array_unref);
   self->enrolled = g_ptr_array_new_with_free_func (g_free);
 
   /* the sensor wants a clean state: start from a USB reset */
   if (!g_usb_device_reset (usb, &error) ||
-      !g_usb_device_claim_interface (usb, FT_INTF, 0, &error))
+      !g_usb_device_claim_interface (usb, FT9366_INTF, 0, &error))
     {
       fpi_device_open_complete (dev, error);
       return;
@@ -741,7 +675,7 @@ dev_close (FpDevice *dev)
   GError *error = NULL;
 
   g_clear_pointer (&self->enrolled, g_ptr_array_unref);
-  g_usb_device_release_interface (fpi_device_get_usb_device (dev), FT_INTF, 0, &error);
+  g_usb_device_release_interface (fpi_device_get_usb_device (dev), FT9366_INTF, 0, &error);
   fpi_device_close_complete (dev, error);
 }
 
@@ -792,7 +726,7 @@ fpi_device_ft9366_class_init (FpiDeviceFt9366Class *klass)
   dev_class->type = FP_DEVICE_TYPE_USB;
   dev_class->id_table = id_table;
   dev_class->scan_type = FP_SCAN_TYPE_PRESS;
-  dev_class->nr_enroll_stages = FT_ENROLL_STAGES;
+  dev_class->nr_enroll_stages = FT9366_ENROLL_STAGES;
   dev_class->temp_hot_seconds = -1;   /* polling for a finger does not heat the sensor */
 
   dev_class->open = dev_open;
