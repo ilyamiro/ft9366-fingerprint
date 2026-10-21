@@ -9,7 +9,8 @@ The driver therefore does its own matching of partial prints.
 The reader is a USB bridge with two bulk endpoints (OUT 0x01, IN 0x82). The driver resets it,
 replays an initialisation sequence (recorded from the device's USB traffic), and then polls an
 interrupt-flag register for a finger. On a touch it reads a few 64x80 frames of 16-bit samples,
-skips the first two (partial contact) and averages the next three. The empty-sensor frames taken
+skips the first (partial contact) and keeps the next three as separate images. (Averaging them was tried first;
+the finger shifts slightly between frames, so the average was blurrier and matched noticeably less often.) The empty-sensor frames taken
 during initialisation serve as the reference image.
 
 ## From frame to template
@@ -20,7 +21,7 @@ during initialisation serve as the reference image.
    sampling pattern).
 5. Store a binary ridge map and a valid-pixel mask next to the keypoints.
 
-One template is stored per enrollment touch (12 touches, about 13 KB each).
+One template is stored per kept frame, up to three per enrollment touch (12 touches, about 13 KB per template).
 
 ## Matching a touch against a template
 1. Candidate keypoint pairs from descriptor similarity (best match clearly better than the second).
@@ -29,13 +30,15 @@ One template is stored per enrollment touch (12 touches, about 13 KB each).
 3. Count how many keypoints land on a template keypoint with a consistent orientation.
 4. Warp the ridge maps together and measure how many overlapping pixels agree locally; a poor
    agreement lowers the score.
-5. Accept when the score is >= 7 and the agreement ratio is >= 0.7 (`FT_ACCEPT_*` in
-   `driver/ft9366_match.h`). A touch matches if it matches any stored template.
+5. Accept when the score is >= 7 and the agreement ratio is >= 0.72 (`FT_ACCEPT_*` in
+   `driver/ft9366_match.h`). A touch matches if any of its frames matches any stored template.
 
 ## Measured behaviour
-On a test set of 75 touches from 5 fingers of one person, with deliberately varied finger placement:
-- 0 false accepts in 2231 different-finger comparisons;
-- about 55% of genuine touches accepted when 10 touches are enrolled.
+On a test set of 75 touches from 5 fingers of one person, with deliberately varied finger placement
+(simulated enrolment of 10 random touches per finger, remaining touches as genuine attempts):
+- 0 false accepts in 18000 simulated different-finger attempts (the highest impostor overlay ratio seen
+  across 20000 frame pairs was 0.69, just under the 0.72 threshold);
+- about 81% of genuine touches accepted (the earlier frame-averaging scheme accepted about 62%).
 
 These numbers come from a single person and were used to pick the thresholds, so treat them as
 optimistic. More testing on other people's fingers is welcome. Expect to retry a touch sometimes;

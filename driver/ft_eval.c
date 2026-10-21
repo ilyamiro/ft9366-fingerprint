@@ -8,7 +8,7 @@ static int rd (const char *p, uint16_t *o)
   for (int i = 0; i < FT_NPIX; i++) o[i] = (b[2 * i] << 8) | b[2 * i + 1]; return 0; }
 int main (int argc, char **argv)
 {
-  FILE *mf = fopen (argv[1], "r"); char line[8192]; static FtTemplate T[128]; char lab[128][64]; int n = 0;
+  FILE *mf = fopen (argv[1], "r"); char line[8192]; static FtTemplate T[512]; char lab[512][64]; int n = 0;
   while (fgets (line, sizeof line, mf))
     {
       char *tok[600]; int nt = 0;

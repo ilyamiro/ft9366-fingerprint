@@ -29,7 +29,7 @@ Optional login / sudo: `security.pam.services.sudo.fprintAuth = true;`
 (keep your password as a fallback).
 
 ## What to expect
-The sensor is tiny (3x4 mm). On the author's fingers roughly half to two thirds of genuine touches
+The sensor is tiny (3x4 mm). On the author's fingers roughly four in five genuine touches
 match on the first try, and other fingers were rejected in every test. Press flat and firmly, cover the
 whole sensor, and retry on a miss. Thresholds were tuned on one person's fingers; please report how it
 works for you. See [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md).

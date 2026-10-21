@@ -40,8 +40,9 @@
 #define FT_FRAME_GAP_MS 60
 #define FT_RESET_WAIT_MS 500
 
-/* frames per touch that are skipped (partial contact) and then averaged */
-#define FT_SKIP_FRAMES 2
+/* frames per touch: the first is skipped (partial contact), the next ones are each matched on their
+ * own. Averaging them blurred the print when the finger shifted and cost a lot of accepted touches. */
+#define FT_SKIP_FRAMES 1
 #define FT_USE_FRAMES  3
 #define FT_MAX_FRAMES  (FT_SKIP_FRAMES + FT_USE_FRAMES)
 
@@ -60,8 +61,8 @@ typedef struct
   guint8  frame[FT_FRAME_LEN];
   guint16 ref_a[FT_NPIX];
   guint16 base[FT_NPIX];   /* empty-sensor reference, taken from the init scans */
-  guint32 sum[FT_NPIX];
-  guint8  img[FT_NPIX];    /* converted image of the last touch */
+  guint16 raw[FT_USE_FRAMES][FT_NPIX];
+  guint8  img[FT_USE_FRAMES][FT_NPIX];   /* converted images of the last touch */
 } FtBuf;
 
 struct _FpiDeviceFt9366
@@ -307,7 +308,6 @@ poll_run_state (FpiSsm *ssm, FpDevice *dev)
         return;
       if (flag & FT_FLAG_DOWN)
         {
-          memset (self->b->sum, 0, sizeof (self->b->sum));
           self->frames = 0;
           self->used = 0;
           fpi_ssm_jump_to_state (ssm, POLL_SCAN);
@@ -333,16 +333,8 @@ poll_run_state (FpiSsm *ssm, FpDevice *dev)
                                                               "scan returned no image"));
           return;
         }
-      if (self->frames >= FT_SKIP_FRAMES)
-        {
-          guint16 tmp[FT_NPIX];
-          int i;
-
-          frame_to_u16 (self->b->frame, tmp);
-          for (i = 0; i < FT_NPIX; i++)
-            self->b->sum[i] += tmp[i];
-          self->used++;
-        }
+      if (self->frames >= FT_SKIP_FRAMES && self->used < FT_USE_FRAMES)
+        frame_to_u16 (self->b->frame, self->b->raw[self->used++]);
       self->frames++;
       fpi_ssm_next_state (ssm);
       break;
@@ -368,12 +360,10 @@ poll_run_state (FpiSsm *ssm, FpDevice *dev)
         }
       else
         {
-          guint16 raw[FT_NPIX];
-          int i;
+          int k;
 
-          for (i = 0; i < FT_NPIX; i++)
-            raw[i] = self->b->sum[i] / self->used;
-          ft_convert_image (raw, self->b->base, self->b->img);
+          for (k = 0; k < self->used; k++)
+            ft_convert_image (self->b->raw[k], self->b->base, self->b->img[k]);
           fpi_ssm_mark_completed (ssm);
         }
       break;
@@ -531,20 +521,23 @@ templates_from_print (FpPrint *print)
   return out;
 }
 
+/* a touch matches if any of its frames matches any stored template */
 static gboolean
-print_matches (FtTemplate *probe, GPtrArray *tpls)
+print_matches (FtTemplate **probes, int nprobes, GPtrArray *tpls)
 {
   guint i;
+  int p;
 
   for (i = 0; i < tpls->len; i++)
-    {
-      FtMatchResult r;
+    for (p = 0; p < nprobes; p++)
+      {
+        FtMatchResult r;
 
-      ft_compare (probe, g_ptr_array_index (tpls, i), &r);
-      fp_dbg ("template %u: score %d ratio %.2f overlap %d", i, r.score, r.ratio, r.overlap);
-      if (ft_is_match (&r))
-        return TRUE;
-    }
+        ft_compare (probes[p], g_ptr_array_index (tpls, i), &r);
+        fp_dbg ("template %u frame %d: score %d ratio %.2f overlap %d", i, p, r.score, r.ratio, r.overlap);
+        if (ft_is_match (&r))
+          return TRUE;
+      }
   return FALSE;
 }
 
@@ -557,26 +550,37 @@ capture_ready (FpiDeviceFt9366 *self)
 {
   FpDevice *dev = FP_DEVICE (self);
   FpiDeviceAction action = fpi_device_get_current_action (dev);
-  FtTemplate *probe = g_new0 (FtTemplate, 1);
-  int nk = ft_template_build (self->b->img, probe);
+  FtTemplate *probes[FT_USE_FRAMES];
+  int np = 0, k;
 
-  fp_dbg ("touch captured, %d keypoints", nk);
+  /* one template per captured frame; frames without enough detail are dropped */
+  for (k = 0; k < self->used; k++)
+    {
+      FtTemplate *t = g_new0 (FtTemplate, 1);
+      int nk = ft_template_build (self->b->img[k], t);
+
+      fp_dbg ("frame %d captured, %d keypoints", k, nk);
+      if (nk < FT_MIN_KEYPOINTS)
+        g_free (t);
+      else
+        probes[np++] = t;
+    }
 
   if (action == FPI_DEVICE_ACTION_ENROLL)
     {
       FpPrint *print = NULL;
 
       fpi_device_get_enroll_data (dev, &print);
-      if (nk < FT_MIN_KEYPOINTS)
+      if (np == 0)
         {
-          g_free (probe);
           fpi_device_enroll_progress (dev, self->stage, NULL,
                                       fpi_device_retry_new_msg (FP_DEVICE_RETRY_CENTER_FINGER,
                                                                 "Not enough fingerprint detail, press the finger firmly on the sensor"));
         }
       else
         {
-          g_ptr_array_add (self->enrolled, probe);
+          for (k = 0; k < np; k++)
+            g_ptr_array_add (self->enrolled, probes[k]);
           self->stage++;
           fpi_device_enroll_progress (dev, self->stage, NULL, NULL);
         }
@@ -594,7 +598,7 @@ capture_ready (FpiDeviceFt9366 *self)
 
   if (action == FPI_DEVICE_ACTION_VERIFY || action == FPI_DEVICE_ACTION_IDENTIFY)
     {
-      if (nk < FT_MIN_KEYPOINTS)
+      if (np == 0)
         {
           GError *err = fpi_device_retry_new_msg (FP_DEVICE_RETRY_CENTER_FINGER,
                                                   "Not enough fingerprint detail, press the finger firmly on the sensor");
@@ -619,7 +623,7 @@ capture_ready (FpiDeviceFt9366 *self)
           tpls = templates_from_print (enrolled);
           if (tpls)
             {
-              ok = print_matches (probe, tpls);
+              ok = print_matches (probes, np, tpls);
               g_ptr_array_unref (tpls);
             }
           fpi_device_verify_report (dev, ok ? FPI_MATCH_SUCCESS : FPI_MATCH_FAIL, NULL, NULL);
@@ -639,7 +643,7 @@ capture_ready (FpiDeviceFt9366 *self)
 
               if (tpls)
                 {
-                  if (print_matches (probe, tpls))
+                  if (print_matches (probes, np, tpls))
                     found = p;
                   g_ptr_array_unref (tpls);
                 }
@@ -647,11 +651,13 @@ capture_ready (FpiDeviceFt9366 *self)
           fpi_device_identify_report (dev, found, NULL, NULL);
           fpi_device_identify_complete (dev, NULL);
         }
-      g_free (probe);
+      for (k = 0; k < np; k++)
+        g_free (probes[k]);
       return;
     }
 
-  g_free (probe);
+  for (k = 0; k < np; k++)
+    g_free (probes[k]);
   fpi_device_action_error (dev, fpi_device_error_new (FP_DEVICE_ERROR_NOT_SUPPORTED));
 }
 

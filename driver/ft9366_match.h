@@ -37,7 +37,7 @@ typedef struct
 
 /* Accept rule, chosen from genuine/impostor measurements (see docs/HOW_IT_WORKS.md). */
 #define FT_ACCEPT_SCORE 7
-#define FT_ACCEPT_RATIO 0.7f
+#define FT_ACCEPT_RATIO 0.72f
 
 /* raw/base: 64x80 sensor samples in host order (base = average of the two empty-sensor init frames) */
 void ft_convert_image (const uint16_t *raw, const uint16_t *base, uint8_t *img);

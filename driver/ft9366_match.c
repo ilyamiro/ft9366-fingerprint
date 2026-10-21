@@ -659,7 +659,7 @@ consistent_subset (const float (*ref)[2], const float (*test)[2], int n, Rigid *
             float ct = vt[a][0] * vt[b][1] - vt[a][1] * vt[b][0];
             float d2r = hypotf (ref[L[a]][0] - ref[L[b]][0], ref[L[a]][1] - ref[L[b]][1]);
             float d2t = hypotf (test[L[a]][0] - test[L[b]][0], test[L[a]][1] - test[L[b]][1]);
-            D2[a][b] = (cr * ct >= 0) && fabsf (d2r - d2t) < 1.0f;
+            D2[a][b] = (cr * ct >= 0) && fabsf (d2r - d2t) < 1.5f;
           }
       for (int k = 0; k < nl; k++)
         if (L[k] == seed)
